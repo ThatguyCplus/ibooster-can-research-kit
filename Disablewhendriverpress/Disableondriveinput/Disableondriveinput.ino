@@ -6,7 +6,7 @@
   Monitors 0x39D (status) for driver_brake_apply signal:
     0 = not_init_or_off
     1 = brakes_not_applied
-    2 = driver_applying_brakes  <- LED blinks when detected
+    2 = driver_applying_brakes  <- LED solid ON, CAN TX disabled (safety)
     3 = fault
 */
 
@@ -53,9 +53,7 @@ static const uint16_t JOY_PRINT_MS = 50; // 20 Hz debug
 // Driver brake detection (0x39D = 925 decimal)
 #define CAN_ID_STATUS 0x39D  // Status message from iBooster
 static uint8_t driver_brake_state = 0;  // Last decoded driver_brake_apply value
-static uint32_t last_led_toggle_ms = 0;
-static bool led_state = false;
-static const uint16_t LED_BLINK_MS = 200;  // 200ms = 2.5 Hz blink rate
+static bool tx_enabled_user = true;  // User's original TX setting (restored when driver releases)
 
 // ---------- CRC8 J1850 ----------
 static uint8_t crc8_j1850(const uint8_t *data, uint8_t len) {
@@ -111,27 +109,32 @@ static void handle_can_receive() {
     if (frame.can_id == CAN_ID_STATUS && frame.can_dlc >= 3) {
       // Extract driver_brake_apply: bits 16-17 (byte 2, bits 0-1)
       // DBC: SG_ driver_brake_apply : 16|2@1+ (1,0) [0|3]
-      driver_brake_state = frame.data[2] & 0x03;
+      uint8_t new_state = frame.data[2] & 0x03;
+      
+      // Handle state transitions
+      if (new_state == 2 && driver_brake_state != 2) {
+        // Driver just pressed brake: save user's TX setting and disable TX
+        tx_enabled_user = tx_enabled;
+        tx_enabled = false;
+        digitalWrite(LED_PIN, HIGH);  // Solid ON
+      } else if (new_state != 2 && driver_brake_state == 2) {
+        // Driver just released brake: restore user's TX setting
+        tx_enabled = tx_enabled_user;
+        digitalWrite(LED_PIN, LOW);  // Turn off LED
+      }
+      
+      driver_brake_state = new_state;
     }
   }
 }
 
 static void update_led() {
-  uint32_t now = millis();
-  
-  if (driver_brake_state == 2) {  // driver_applying_brakes
-    // Blink LED
-    if ((uint32_t)(now - last_led_toggle_ms) >= LED_BLINK_MS) {
-      last_led_toggle_ms = now;
-      led_state = !led_state;
-      digitalWrite(LED_PIN, led_state ? HIGH : LOW);
-    }
+  // LED is updated in handle_can_receive() on state transitions
+  // Solid ON when driver_brake_state == 2, OFF otherwise
+  if (driver_brake_state == 2) {
+    digitalWrite(LED_PIN, HIGH);
   } else {
-    // Turn off LED when not applying brakes
-    if (led_state) {
-      led_state = false;
-      digitalWrite(LED_PIN, LOW);
-    }
+    digitalWrite(LED_PIN, LOW);
   }
 }
 
@@ -213,8 +216,24 @@ static void handle_line(char *s) {
   char *cmd = strtok(s, " ");
   if (!cmd) return;
 
-  if (!strcmp(cmd, "tx1"))  { tx_enabled = true;  Serial.println(F("TX ON")); return; }
-  if (!strcmp(cmd, "tx0"))  { tx_enabled = false; Serial.println(F("TX OFF")); return; }
+  if (!strcmp(cmd, "tx1"))  { 
+    tx_enabled_user = true;
+    // Only update tx_enabled if driver is not pressing brake
+    if (driver_brake_state != 2) {
+      tx_enabled = true;
+    }
+    Serial.println(F("TX ON")); 
+    return; 
+  }
+  if (!strcmp(cmd, "tx0"))  { 
+    tx_enabled_user = false;
+    // Only update tx_enabled if driver is not pressing brake
+    if (driver_brake_state != 2) {
+      tx_enabled = false;
+    }
+    Serial.println(F("TX OFF")); 
+    return; 
+  }
 
   if (!strcmp(cmd, "ext1")) { ext_request = true;  Serial.println(F("ext=1")); return; }
   if (!strcmp(cmd, "ext0")) { ext_request = false; Serial.println(F("ext=0")); return; }
@@ -294,6 +313,7 @@ void setup() {
 
   Serial.println(F("iBooster OPEN+JOYSTICK ready."));
   Serial.println(F("Monitoring 0x39D for driver brake input..."));
+  Serial.println(F("Safety: CAN TX disabled when driver presses brake"));
   Serial.println(F("Type: status | joydbg1 | cal"));
 }
 
@@ -321,10 +341,11 @@ void loop() {
   }
 
   // 100Hz scheduler
+  // Safety: Do not send CAN messages when driver is pressing brake
   uint32_t now = micros();
   if ((int32_t)(now - next_tick_us) >= 0) {
     next_tick_us += PERIOD_US;
-    if (tx_enabled) {
+    if (tx_enabled && driver_brake_state != 2) {
       send_triplet(cnt, flow_cmd);
       cnt = (uint8_t)((cnt + 1) & 0x0F);
     }
