@@ -56,24 +56,7 @@ Location: `docs/`
 
 > iBooster channels are often **not terminated internally**. Your test network typically needs **one 120Ω at each end** of the bus.
 
----
 
-## Repository layout
-
-- `arduino/`  
-  Arduino sketches + helper headers for frame packing/unpacking and checksum experiments.
-- `tools/`  
-  Optional helper scripts for log parsing / playback generation.
-- `docs/`  
-  Wiring, SavvyCAN notes, troubleshooting, bench safety checklist.
-- `ACKNOWLEDGEMENTS.md`  
-  Credit and links to all public sources that informed this work.
-- `DISCLAIMER.md`  
-  Full disclaimer text (repeat of the warnings above, but more explicit).
-- `LICENSE`  
-  Open-source license (copyleft recommended if you want changes shared back).
-
----
 
 ## What this repo is *not*
 - Not an OEM DBC.
@@ -90,19 +73,12 @@ This is **research + experimentation**, written to be readable and verifiable.
 This project is built from **many public sources** (forums, open repos, documentation, tool authors, and community discoveries). I’m intentionally collecting what helped me in one place — **with credit**.
 
 ### Where credits live
-- **`ACKNOWLEDGEMENTS.md`**: full list of sources/tools/people + what they contributed
-- Inline comments in code for specific logic borrowed/adapted (frame IDs, checksum hypotheses, decoding hints, etc.)
+- **`ACKNOWLEDGEMENTS.md`**
+https://github.com/open-vehicle-control-system/dbc/tree/main/ibooster
 
 ### If you contributed ideas or code
 Open an issue/PR and I’ll add you to acknowledgements. If anything is missing or attributed incorrectly, please tell me — I want this to be respectful and accurate.
 
----
-
-## Contributing (please read)
-- Keep contributions bench-focused and clearly labeled experimental
-- Don’t post proprietary documents, leaked OEM material, or anything copyrighted
-- Prefer small, testable PRs (one improvement per PR)
-- Add notes: what was tested, on what hardware, and what the result was
 
 ---
 
@@ -110,13 +86,6 @@ Open an issue/PR and I’ll add you to acknowledgements. If anything is missing 
 This repo uses a copyleft license so improvements remain open.  
 See `LICENSE` for details.
 
----
-
-## Contact / Support
-Use GitHub Issues for:
-- “No motion” troubleshooting (include logs, wiring, CAN bitrate, crystal freq)
-- Checksum/CRC validation notes
-- New signal discoveries (include evidence and how you tested)
 
 ---
 
