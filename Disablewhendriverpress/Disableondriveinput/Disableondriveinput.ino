@@ -1,332 +1,292 @@
 /*
-  iBooster Gen2 YAW CAN - OPEN CONTROL + JOYSTICK (Mega2560 + MCP2515)
-  100 Hz: 0x38B(4), 0x38C(4), 0x38D(7)
-  Serial @ 500000: tx1/tx0 ext1/ext0 joy1/joy0 cal db N joydbg1/joydbg0 flow HEX hold status
-  
-  Monitors 0x39D (status) for driver_brake_apply signal:
-    0 = not_init_or_off
-    1 = brakes_not_applied
-    2 = driver_applying_brakes  <- LED blinks when detected
-    3 = fault
+  iBooster Gen2 YAW CAN - OPEN CONTROL + JOYSTICK + DRIVER BRAKE MONITOR + BUS WATCHDOG
+  Mega2560 + MCP2515 @ 500 kbps
+
+  TX @100Hz:
+    0x38B DLC=4: [CRC] [REQ|cnt] 00 05      (always when tx_enabled)
+    0x38D DLC=7: [CRC] [cnt]     00 00 00 50 47  (always when tx_enabled)
+    0x38C DLC=4: [CRC] [REQ|cnt] flow_LSB flow_MSB (ONLY when bus alive AND driver not braking)
+
+  RX:
+    Monitors 0x39D for driver_brake_apply (2-bit enum):
+      0 = not_init_or_off
+      1 = brakes_not_applied
+      2 = driver_applying_brakes  -> LED solid ON, 0x38C inhibited
+      3 = fault
+
+  Bus Watchdog:
+    If NO RX frames seen for BUS_TIMEOUT_MS:
+      - bus_alive=false
+      - clear driver_brake_state (prevents LED stuck)
+      - LED slow blinks to indicate bus dead
+      - STILL transmits minimal 0x38B/0x38D (if tx_enabled)
+
+  Joystick VRy on A0:
+    Center -> HOLD (0x7E00)
+    Above center -> APPLY up to FLOW_APPLY_MAX
+    Below center -> RELEASE down to FLOW_RELEASE_MIN
+
+  Serial @500000:
+    tx1/tx0, ext1/ext0, joy1/joy0, cal, db N, joydbg1/joydbg0, flow HEX, hold, status
 */
 
 #include <SPI.h>
 #include <mcp2515.h>
 
-// ---- CAN config ----
+// ---------------- CAN config ----------------
 #define CS_PIN     4
 #define CAN_SPEED  CAN_500KBPS
-#define MCP_CLOCK  MCP_8MHZ   // MCP_16MHZ if your module is 16MHz
+#define MCP_CLOCK  MCP_8MHZ   // MCP_16MHZ if your MCP2515 crystal is 16MHz
 MCP2515 can(CS_PIN);
 
-// ---- IO ----
+// ---------------- IO ----------------
 static const uint8_t JOY_PIN = A0;
-static const uint8_t LED_PIN = 13;  // Built-in LED on Mega2560
+static const uint8_t LED_PIN = 13;  // Mega2560 built-in LED
 
-// ---- Flow config ----
+// ---------------- Flow config ----------------
 static const uint16_t FLOW_NEUTRAL     = 0x7E00;
 static const uint16_t FLOW_APPLY_MAX   = 0x9200;
 static const uint16_t FLOW_RELEASE_MIN = 0x6A00;
 
-// ---- State ----
-static bool tx_enabled  = true;
-static bool ext_request = true;
-static bool joy_enabled = true;
-static bool joy_debug   = false;
-
-static uint16_t flow_manual = FLOW_NEUTRAL;
-static uint16_t flow_cmd    = FLOW_NEUTRAL;
+// ---------------- Driver brake decode ----------------
+static const uint16_t CAN_ID_STATUS = 0x39D;  // you said driver_brake_apply is hereis hereis hereis here
+static uint8_t driver_brake_state = 0;        // 0..3
+static uint16_t flow_cmd_slewed = FLOW_NEUTRAL;  // Slew-limited flow command
 static uint8_t  cnt         = 0;
 
-// 100 Hz scheduler
+// ---------------- Flow slew limiter ----------------
+static const uint16_t FLOW_SLEW_RATE = 0x0100;  // Max change per 10ms tick (256 units = ~1.5% of range)
+
+// 100Hz scheduler
 static uint32_t next_tick_us = 0;
 static const uint32_t PERIOD_US = 10000;
+    return true;
 
-// joystick (integer filter)
-static int joy_raw = 512;
-static int joy_filt = 512;
-static int joy_center = 512;
-static int joy_deadband = 30;   // ADC counts
-static uint32_t last_joy_print_ms = 0;
-static const uint16_t JOY_PRINT_MS = 50; // 20 Hz debug
-
-// Driver brake detection (0x39D = 925 decimal)
-#define CAN_ID_STATUS 0x39D  // Status message from iBooster
-static uint8_t driver_brake_state = 0;  // Last decoded driver_brake_apply value
-static uint32_t last_led_toggle_ms = 0;
-static bool led_state = false;
-static const uint16_t LED_BLINK_MS = 200;  // 200ms = 2.5 Hz blink rate
-
-// ---------- CRC8 J1850 ----------
-static uint8_t crc8_j1850(const uint8_t *data, uint8_t len) {
-  uint8_t crc = 0xFF;
-  for (uint8_t i = 0; i < len; i++) {
-    crc ^= data[i];
-    for (uint8_t b = 0; b < 8; b++) {
-      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x1D) : (uint8_t)(crc << 1);
-    }
-  }
-  return (uint8_t)(crc ^ 0xFF);
-}
-
+  can.sendMessage(&f); if (!send_crc_frame(0x38C, p, 3)) all_ok = false;
 static inline void send_frame(uint16_t id, const uint8_t *data, uint8_t dlc) {
-  struct can_frame f;
-  f.can_id = id;
-  f.can_dlc = dlc;
-  for (uint8_t i = 0; i < dlc; i++) f.data[i] = data[i];
-  can.sendMessage(&f);
-}
-
-static inline void send_crc_frame(uint16_t id, const uint8_t *payload, uint8_t plen) {
-  uint8_t out[8];                 // enough for max DLC here
-  out[0] = crc8_j1850(payload, plen);
-  for (uint8_t i = 0; i < plen; i++) out[i + 1] = payload[i];
   send_frame(id, out, (uint8_t)(plen + 1));
 }
-
-static inline void send_triplet(uint8_t c, uint16_t flow) {
-  const uint8_t reqcnt = (uint8_t)((ext_request ? 0x40 : 0x00) | (c & 0x0F));
-  uint8_t p[6];
-
-  // 0x38B: [REQ|cnt] 00 05
-  p[0] = reqcnt; p[1] = 0x00; p[2] = 0x05;
-  send_crc_frame(0x38B, p, 3);
-
-  // 0x38C: [REQ|cnt] flow_LSB flow_MSB (little-endian)
-  p[0] = reqcnt; p[1] = (uint8_t)(flow & 0xFF); p[2] = (uint8_t)(flow >> 8);
-  send_crc_frame(0x38C, p, 3);
-
-  // 0x38D: [cnt] 00 00 00 50 47
-  p[0] = (uint8_t)(c & 0x0F); p[1] = 0x00; p[2] = 0x00; p[3] = 0x00; p[4] = 0x50; p[5] = 0x47;
-  send_crc_frame(0x38D, p, 6);
-}
-
-// ---------- CAN Receive & Decode driver_brake_apply ----------
-// Decode driver_brake_apply from 0x39D status message
-// Signal: bit 16, length 2 bits, little-endian
-// States: 0=not_init_or_off, 1=brakes_not_applied, 2=driver_applying_brakes, 3=fault
-static void handle_can_receive() {
-  struct can_frame frame;
-  if (can.readMessage(&frame) == MCP2515::ERROR_OK) {
-    if (frame.can_id == CAN_ID_STATUS && frame.can_dlc >= 3) {
-      // Extract driver_brake_apply: bits 16-17 (byte 2, bits 0-1)
-      // DBC: SG_ driver_brake_apply : 16|2@1+ (1,0) [0|3]
-      driver_brake_state = frame.data[2] & 0x03;
-    }
-  }
-}
-
-static void update_led() {
-  uint32_t now = millis();
-  
-  if (driver_brake_state == 2) {  // driver_applying_brakes
-    // Blink LED
-    if ((uint32_t)(now - last_led_toggle_ms) >= LED_BLINK_MS) {
-      last_led_toggle_ms = now;
-      led_state = !led_state;
-      digitalWrite(LED_PIN, led_state ? HIGH : LOW);
-    }
-  } else {
-    // Turn off LED when not applying brakes
-    if (led_state) {
-      led_state = false;
-      digitalWrite(LED_PIN, LOW);
-    }
-  }
-}
-
-// ---------- Joystick update + map ----------
-static inline uint16_t clamp_u16(uint16_t v, uint16_t lo, uint16_t hi) {
-  if (v < lo) return lo;
-  if (v > hi) return hi;
-  return v;
-}
-
-static inline uint16_t map_joystick_to_flow() {
-  joy_raw = analogRead(JOY_PIN);
-
-  // integer IIR filter ~ alpha=0.2 : filt += (raw - filt)/5
-  joy_filt += (joy_raw - joy_filt) / 5;
-
-  int d = joy_filt - joy_center;
-  int ad = (d < 0) ? -d : d;
-  if (ad <= joy_deadband) return FLOW_NEUTRAL;
-
-  if (d > 0) {
-    // APPLY
-    int denom = (1023 - joy_center) - joy_deadband;
+  can.sendMessage(&f); send_crc_frame(0x38C, p, 3);
+static inline void send_frame(uint16_t id, const uint8_t *data, uint8_t dlc) {
+  send_frame(id, out, (uint8_t)(plen + 1));
     if (denom < 1) denom = 1;
-    uint32_t span = (uint32_t)(FLOW_APPLY_MAX - FLOW_NEUTRAL);
-    uint32_t add  = (span * (uint32_t)(d - joy_deadband)) / (uint32_t)denom;
-    return clamp_u16((uint16_t)(FLOW_NEUTRAL + add), FLOW_NEUTRAL, FLOW_APPLY_MAX);
+  can.sendMessage(&f); send_crc_frame(0x38C, p, 3);
+static inline void send_frame(uint16_t id, const uint8_t *data, uint8_t dlc) {
+  send_frame(id, out, (uint8_t)(plen + 1));
+        rx_count_in_window = 0;
+  can.sendMessage(&f); send_crc_frame(0x38C, p, 3);st_valid_rx_ms) > BUS_ALIVE_WINDOW_MS) {if (!bus_alive) {
+static inline void send_frame(uint16_t id, const uint8_t *data, uint8_t dlc) {se; Serial.println(F("ext=0")); return; }
+static uint32_t last_rx_ms = 0;
+static const uint16_t BUS_TIMEOUT_MS = 200;   // tweak 100..500ms
+  send_frame(id, out, (uint8_t)(plen + 1));
+        flow_cmd = (uint16_t)(flow_cmd_slewed - FLOW_SLEW_RATE);
+      }
   } else {
-    // RELEASE
-    int denom = joy_center - joy_deadband;
-    if (denom < 1) denom = 1;
-    uint32_t span = (uint32_t)(FLOW_NEUTRAL - FLOW_RELEASE_MIN);
-    uint32_t sub  = (span * (uint32_t)((-d) - joy_deadband)) / (uint32_t)denom;
-    return clamp_u16((uint16_t)(FLOW_NEUTRAL - sub), FLOW_RELEASE_MIN, FLOW_NEUTRAL);
-  }
-}
+  can.sendMessage(&f); send_crc_frame(0x38C, p, 3);s drops)
+static inline void send_frame(uint16_t id, const uint8_t *data, uint8_t dlc) {
+  send_frame(id, out, (uint8_t)(plen + 1));
+      // Double-check: Never send control if driver is braking, even if bus_alive
+      if (allow_control && driver_brake_state == 2) {
+  } else {
+  can.sendMessage(&f); send_crc_frame(0x38C, p, 3);
+static inline void send_frame(uint16_t id, const uint8_t *data, uint8_t dlc) {
+  send_frame(id, out, (uint8_t)(plen + 1));
+  } else {
+    // Bus is alive (valid 0x39D received within timeout)
+  } else {
+  can.sendMessage(&f);    last_rx_ms = millis();
+      bus_alive = true;  // Only set when we get valid 0x39D
 
-// ---------- Serial parsing ----------
-static char linebuf[64];
-static uint8_t linelen = 0;
+    if (id != CAN_ID_STATUS) continue;
+    if (f.can_dlc < 3) continue;    // driver_brake_apply: 16|2@1+  -> byte2 bits0..1
+    uint8_t new_state = (uint8_t)(f.data[2] & 0x03);
 
-static uint16_t parse_hex_u16(const char *s, bool *ok) {
-  char *endp = nullptr;
-  long v = strtol(s, &endp, 16);
-  *ok = (endp != s) && (v >= 0) && (v <= 0xFFFF);
-  return (uint16_t)v;
-}
+    if (new_state != driver_brake_state) {
+      driver_brake_state = new_state;
+      Serial.print(F("0x39D driver_brake_apply="));
+      Serial.print(driver_brake_state);
+      Serial.print(F(" ("));
+      switch (driver_brake_state) {
+        case 0: Serial.print(F("not_init_or_off")); break;
+  } else {
+    // Bus is alive (valid 0x39D received within timeout)
+    if (!bus_alive) {
+      // Bus just came back alive
+      Serial.println(F("Bus watchdog: iBooster responding"));
+    }
+    bus_alive = true;
+  } driver_brake_state = 0;    // bus is alive  if (!strcmp(cmd, "tx1"))  { tx_enabled = true;  Serial.println(F("TX ON")); return; }
+  if (!strcmp(cmd, "tx0"))  { tx_enabled = false; Serial.println(F("TX OFF")); return; }  // compute flow command
+  flow_cmd = joy_enabled ? map_joystick_to_flow() : flow_manual;      // Keepalive always (even if bus dead), but inhibit control if:
+      //  - bus not alive, OR
+      //  - driver is pressing brakes (state 2)    last_rx_ms = millis();
+    bus_alive = true;
 
-static int parse_int(const char *s, bool *ok) {
-  char *endp = nullptr;
-  long v = strtol(s, &endp, 10);
-  *ok = (endp != s);
-  return (int)v;
-}
+    if (id != CAN_ID_STATUS) continue;
+    if (f.can_dlc < 3) continue;    // driver_brake_apply: 16|2@1+  -> byte2 bits0..1
+    uint8_t new_state = (uint8_t)(f.data[2] & 0x03);
 
-static void cmd_status() {
-  Serial.print(F("TX=")); Serial.print(tx_enabled ? F("ON") : F("OFF"));
-  Serial.print(F(" ext=")); Serial.print(ext_request ? 1 : 0);
-  Serial.print(F(" joy=")); Serial.print(joy_enabled ? 1 : 0);
-  Serial.print(F(" flow=0x")); Serial.print(flow_cmd, HEX);
-  Serial.print(F(" manual=0x")); Serial.print(flow_manual, HEX);
-  Serial.print(F(" raw=")); Serial.print(joy_raw);
-  Serial.print(F(" filt=")); Serial.print(joy_filt);
-  Serial.print(F(" center=")); Serial.print(joy_center);
-  Serial.print(F(" db=")); Serial.print(joy_deadband);
-  Serial.print(F(" brake_state=")); Serial.print(driver_brake_state);
-  Serial.print(F(" ("));
-  switch (driver_brake_state) {
-    case 0: Serial.print(F("not_init_or_off")); break;
-    case 1: Serial.print(F("brakes_not_applied")); break;
-    case 2: Serial.print(F("driver_applying_brakes")); break;
-    case 3: Serial.print(F("fault")); break;
-    default: Serial.print(F("unknown")); break;
-  }
-  Serial.println(F(")"));
-}
+    if (new_state != driver_brake_state) {
+      driver_brake_state = new_state;
+      Serial.print(F("0x39D driver_brake_apply="));
+      Serial.print(driver_brake_state);
+      Serial.print(F(" ("));
+      switch (driver_brake_state) {
+        case 0: Serial.print(F("not_init_or_off")); break;
+        case 1: Serial.print(F("brakes_not_applied")); break;
+        case 2: Serial.print(F("driver_applying_brakes")); break;
+        case 3: Serial.print(F("fault")); break;
+      }
+      Serial.println(F(")"));
+    }
+  }    // IMPORTANT: clear latched brake state so LED never sticks ON
+    driver_brake_state = 0;    // bus is alive  if (!strcmp(cmd, "tx1"))  { tx_enabled = true;  Serial.println(F("TX ON")); return; }
+  if (!strcmp(cmd, "tx0"))  { tx_enabled = false; Serial.println(F("TX OFF")); return; }  // compute flow command
+  flow_cmd = joy_enabled ? map_joystick_to_flow() : flow_manual;      // Keepalive always (even if bus dead), but inhibit control if:
+      //  - bus not alive, OR
+      //  - driver is pressing brakes (state 2)    last_rx_ms = millis();
+    bus_alive = true;
 
-static void handle_line(char *s) {
-  char *cmd = strtok(s, " ");
-  if (!cmd) return;
+    if (id != CAN_ID_STATUS) continue;
+    if (f.can_dlc < 3) continue;    // driver_brake_apply: 16|2@1+  -> byte2 bits0..1
+    uint8_t new_state = (uint8_t)(f.data[2] & 0x03);
 
+    if (new_state != driver_brake_state) {
+      driver_brake_state = new_state;
+      Serial.print(F("0x39D driver_brake_apply="));
+      Serial.print(driver_brake_state);
+      Serial.print(F(" ("));
+      switch (driver_brake_state) {
+        case 0: Serial.print(F("not_init_or_off")); break;
+        case 1: Serial.print(F("brakes_not_applied")); break;
+        case 2: Serial.print(F("driver_applying_brakes")); break;
+        case 3: Serial.print(F("fault")); break;
+      }
+      Serial.println(F(")"));
+    }
+  }    // IMPORTANT: clear latched brake state so LED never sticks ON
+    driver_brake_state = 0;    // bus is alive  if (!strcmp(cmd, "tx1"))  { tx_enabled = true;  Serial.println(F("TX ON")); return; }
+    bus_alive = true;
+    last_rx_ms = millis();
+    bus_alive = true;
+    last_rx_ms = millis();
+    bus_alive = true;
+
+
+    if (id != CAN_ID_STATUS) continue;
+    if (f.can_dlc < 3) continue;
+    uint8_t new_state = (uint8_t)(f.data[2] & 0x03); case 0: Serial.print(F("not_init_or_off")); break;
+    // driver_brake_apply: 16|2@1+  -> byte2 bits0..1
+    uint8_t new_state = (uint8_t)(f.data[2] & 0x03); case 0: Serial.print(F("not_init_or_off")); break;
+        case 1: Serial.print(F("brakes_not_applied")); break;
+    if (new_state != driver_brake_state) {
+      driver_brake_state = new_state;
+      Serial.print(F("0x39D driver_brake_apply="));
+      Serial.print(driver_brake_state);
+      Serial.print(F(" ("));
+      switch (driver_brake_state) {
+        case 0: Serial.print(F("not_init_or_off")); break;
+        case 1: Serial.print(F("brakes_not_applied")); break;
+        case 2: Serial.print(F("driver_applying_brakes")); break;
+        case 3: Serial.print(F("fault")); break;
+      }
+      Serial.println(F(")"));
+    }      // Bus just went dead
+    // bus is aliver latched brake state so LED never sticks ON
+    // Also prevents sending control when bus is dead
+    if (driver_brake_state != 0) {
+      driver_brake_state = 0;
+      Serial.println(F("Cleared driver_brake_state due to bus timeout"));
   if (!strcmp(cmd, "tx1"))  { tx_enabled = true;  Serial.println(F("TX ON")); return; }
   if (!strcmp(cmd, "tx0"))  { tx_enabled = false; Serial.println(F("TX OFF")); return; }
-
-  if (!strcmp(cmd, "ext1")) { ext_request = true;  Serial.println(F("ext=1")); return; }
-  if (!strcmp(cmd, "ext0")) { ext_request = false; Serial.println(F("ext=0")); return; }
-
-  if (!strcmp(cmd, "joy1")) { joy_enabled = true;  Serial.println(F("joy=1")); return; }
-  if (!strcmp(cmd, "joy0")) { joy_enabled = false; Serial.println(F("joy=0")); return; }
-
-  if (!strcmp(cmd, "joydbg1")) { joy_debug = true;  Serial.println(F("joy_debug=1")); return; }
-  if (!strcmp(cmd, "joydbg0")) { joy_debug = false; Serial.println(F("joy_debug=0")); return; }
-
-  if (!strcmp(cmd, "cal")) { joy_center = joy_filt; Serial.println(F("center calibrated")); return; }
-
-  if (!strcmp(cmd, "db")) {
-    char *n = strtok(nullptr, " ");
-    bool ok=false;
-    if (n) {
-      int v = parse_int(n, &ok);
-      if (ok) {
-        if (v < 0) v = 0;
-        if (v > 300) v = 300;
-        joy_deadband = v;
-        Serial.println(F("deadband set"));
-        return;
+      Serial.println(F("Bus watchdog: iBooster responding"));
+    }  // compute flow command (only if bus is alive, otherwise keep neutral)
+    // IMPORTANT: clear latched brake state so LED never sticks ON
+    driver_brake_state = 0;low_cmd = FLOW_NEUTRAL;
+  }  if (!strcmp(cmd, "tx1"))  { 
+    // bus is alivex_enabled = true;  
+    Serial.println(F("TX ON")); 
+    return; 
+  }
+  if (!strcmp(cmd, "tx0"))  { 
+    tx_enabled = false; 
+  if (!strcmp(cmd, "tx1"))  { tx_enabled = true;  Serial.println(F("TX ON")); return; }
+  if (!strcmp(cmd, "tx0"))  { tx_enabled = false; Serial.println(F("TX OFF")); return; }
+  }  // compute flow command (only if bus is alive, otherwise keep neutral)
+  // SAFETY: Don't compute new commands when bus is dead to avoid stale values
+  if (bus_alive) {
+    flow_cmd = joy_enabled ? map_joystick_to_flow() : flow_manual;
+  } else {
+    // Bus dead: force neutral to prevent sending stale commands when bus recovers
+    flow_cmd = FLOW_NEUTRAL;
+  }  // compute flow command (only if bus is alive, otherwise keep neutral)
+  // SAFETY: Don't compute new commands when bus is dead to avoid stale values
+  if (bus_alive) {
+    flow_cmd = joy_enabled ? map_joystick_to_flow() : flow_manual;
+  } else {
+    // Bus dead: force neutral to prevent sending stale commands when bus recovers
+    flow_cmd = FLOW_NEUTRAL;
+  }      // SAFETY: Multiple layers of protection
+      // 1. Bus must be alive (valid 0x39D received within timeout)
+      // 2. Driver must not be pressing brakes (state != 2)
+      // 3. flow_cmd is forced to NEUTRAL when bus is dead (see above)      
+      // Double-check: Never send control if driver is braking, even if bus_alive
+  if (!strcmp(cmd, "tx1"))  { tx_enabled = true;  Serial.println(F("TX ON")); return; }
+  if (!strcmp(cmd, "tx0"))  { tx_enabled = false; Serial.println(F("TX OFF")); return; }   // 2. Driver must not be pressing brakes (state != 2)
+      // 3. flow_cmd is forced to NEUTRAL when bus is dead (see above)      
+      // Double-check: Never send control if driver is braking, even if bus_alive
+      if (allow_control && driver_brake_state == 2) {
+        allow_control = false;  // Extra safety check
       }
-    }
-    Serial.println(F("usage: db 30"));
-    return;
-  }
-
-  if (!strcmp(cmd, "flow")) {
-    char *hx = strtok(nullptr, " ");
-    bool ok=false;
-    if (hx) {
-      flow_manual = parse_hex_u16(hx, &ok);
-      if (ok) { Serial.println(F("manual flow set")); return; }
-    }
-    Serial.println(F("usage: flow 7E00"));
-    return;
-  }
-
-  if (!strcmp(cmd, "hold"))   { flow_manual = FLOW_NEUTRAL; Serial.println(F("manual HOLD")); return; }
-  if (!strcmp(cmd, "status")) { cmd_status(); return; }
-
-  Serial.println(F("cmds: tx1 tx0 | ext1 ext0 | joy1 joy0 | cal | db N | joydbg1 joydbg0 | flow HEX | hold | status"));
-}
-
-static void handle_serial() {
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == '\r') continue;
-    if (c == '\n') {
-      linebuf[linelen] = 0;
-      if (linelen) handle_line(linebuf);
-      linelen = 0;
-    } else if (linelen < sizeof(linebuf) - 1) {
-      linebuf[linelen++] = c;
-    }
-  }
-}
-
-void setup() {
-  Serial.begin(500000);
-  pinMode(JOY_PIN, INPUT);
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
-
-  SPI.begin();
-  can.reset();
-  can.setBitrate(CAN_SPEED, MCP_CLOCK);
-  can.setNormalMode();
-
-  joy_raw = analogRead(JOY_PIN);
-  joy_filt = joy_raw;
-  joy_center = joy_raw;
-
-  next_tick_us = micros();
-
-  Serial.println(F("iBooster OPEN+JOYSTICK ready."));
-  Serial.println(F("Monitoring 0x39D for driver brake input..."));
-  Serial.println(F("Type: status | joydbg1 | cal"));
-}
-
-void loop() {
-  handle_serial();
-
-  // Check for incoming CAN messages (0x39D status)
-  handle_can_receive();
-
-  // Update LED based on driver brake state
-  update_led();
-
-  // update flow command (and capture joy_raw/joy_filt once)
+      
+  // compute flow command
+  flow_cmd = joy_enabled ? map_joystick_to_flow() : flow_manual;      // Keepalive always (even if bus dead), but inhibit control if:
+      //  - bus not alive, OR
+      //  - driver is pressing brakes (state 2)  // compute flow command
+  flow_cmd = joy_enabled ? map_joystick_to_flow() : flow_manual;      // Keepalive always (even if bus dead), but inhibit control if:
+      //  - bus not alive, OR
+      //  - driver is pressing brakes (state 2)  // compute flow command
+  flow_cmd = joy_enabled ? map_joystick_to_flow() : flow_manual;  // compute flow command
+  flow_cmd = joy_enabled ? map_joystick_to_flow() : flow_manual;  // compute flow command (only if bus is alive, otherwise keep neutral)
+  // SAFETY: Don't compute new commands when bus is dead to avoid stale values
+  if (bus_alive) {
+    flow_cmd = joy_enabled ? map_joystick_to_flow() : flow_manual;
+  } else {
+    // Bus dead: force neutral to prevent sending stale commands when bus recovers
+    flow_cmd = FLOW_NEUTRAL;
+  }  // compute flow command (only if bus is alive, otherwise keep neutral)
+  // SAFETY: Don't compute new commands when bus is dead to avoid stale values
+  if (bus_alive) {
+    flow_cmd = joy_enabled ? map_joystick_to_flow() : flow_manual;
+  } else {
+    // Bus dead: force neutral to prevent sending stale commands when bus recovers
+  // compute flow command
+  flow_cmd = joy_enabled ? map_joystick_to_flow() : flow_manual;ep neutral)
+  // SAFETY: Don't compute new commands when bus is dead to avoid stale values
+  if (bus_alive) {
+    flow_cmd = joy_enabled ? map_joystick_to_flow() : flow_manual;
+  } else {
+    // Bus dead: force neutral to prevent sending stale commands when bus recovers
+    flow_cmd = FLOW_NEUTRAL;
+  }      // SAFETY: Multiple layers of protection
+      // 1. Bus must be alive (valid 0x39D received within timeout)
+      // 2. Driver must not be pressing brakes (state != 2)
+      // 3. flow_cmd is forced to NEUTRAL when bus is dead (see above)      
+      // Double-check: Never send control if driver is braking, even if bus_alive
+      if (allow_control && driver_brake_state == 2) {
+        allow_control = false;  // Extra safety check
+      }
+      
+      // SAFETY: Multiple layers of protection
+      // 1. Bus must be alive (valid 0x39D received within timeout)
+      // 2. Driver must not be pressing brakes (state != 2)
+      // Keepalive always (even if bus dead), but inhibit control if:
+      //  - bus not alive, OR
+      //  - driver is pressing brakes (state 2)
+      }
+  // compute flow command
+  flow_cmd = joy_enabled ? map_joystick_to_flow() : flow_manual;      // Keepalive always (even if bus dead), but inhibit control if:
+      //  - bus not alive, OR
+      //  - driver is pressing brakes (state 2)  // compute flow command
+  flow_cmd = joy_enabled ? map_joystick_to_flow() : flow_manual;  // compute flow command
   flow_cmd = joy_enabled ? map_joystick_to_flow() : flow_manual;
-
-  // joystick debug @20Hz (CSV for Serial Plotter)
-  if (joy_debug && (uint32_t)(millis() - last_joy_print_ms) >= JOY_PRINT_MS) {
-    last_joy_print_ms += JOY_PRINT_MS;
-    int delta = joy_filt - joy_center;
-    Serial.print(joy_raw);   Serial.print(',');
-    Serial.print(joy_filt);  Serial.print(',');
-    Serial.print(joy_center);Serial.print(',');
-    Serial.print(delta);     Serial.print(',');
-    Serial.println((int)flow_cmd);
-  }
-
-  // 100Hz scheduler
-  uint32_t now = micros();
-  if ((int32_t)(now - next_tick_us) >= 0) {
-    next_tick_us += PERIOD_US;
-    if (tx_enabled) {
-      send_triplet(cnt, flow_cmd);
-      cnt = (uint8_t)((cnt + 1) & 0x0F);
-    }
-  }
-}
