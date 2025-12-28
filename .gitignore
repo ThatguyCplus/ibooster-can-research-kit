@@ -1,0 +1,79 @@
+# Arduino
+*.hex
+*.eep
+*.elf
+*.map
+*.sym
+*.lss
+
+# Build artifacts
+build/
+*.bin
+
+# Arduino IDE
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Visual Studio Code
+.vscode/
+*.code-workspace
+
+# Platform IO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Python (for analysis scripts)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+
+# Logs and data
+*.log
+*.csv
+*.dat
+logs/
+data/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+
+# OS generated
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE specific
+*.sublime-project
+*.sublime-workspace
+.idea/
+*.iml
+
+# Documentation builds
+docs/_build/
+docs/.buildinfo
+
+# Test outputs
+test_results/
+*.pcap
+*.trc
+
+# CAN logs
+*.blf
+*.asc
+*.trc
